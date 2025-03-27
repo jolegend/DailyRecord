@@ -1,0 +1,217 @@
+1、RabbitMQ ：
+
+①消息持久化双写方案是什么？具体实现？本地事务表记录+异步确认机制是什么？具体实现？
+
+是一种确保消息不丢失的机制，通过在生产者和消费者两端进行配置，以及对RabbitMQ服务器进行相关设置来实现消息的持久化存储和可靠传输。
+
+1. 生产者端配置：
+   - 启用消息确认机制： 生产者在发送消息时，开启Confirm模式，通过设置channel.confirmSelect()来启用该模式。这样，当消息成功发送到交换器后，RabbitMQ会发送一个确认消息给生产者。
+   - 设置消息持久化属性： 在发布消息时，将消息的deliveryMode属性设置为2，表示该消息需要持久化存储。
+2. RabbitMQ服务器配置：
+   - 队列持久化： 声明队列时，将队列设置为持久化模式，这样即使RabbitMQ服务器重启，队列中的消息也不会丢失。可以通过QueueBuilder.durable()方法来创建持久化的队列。
+   - 镜像队列（可选）： 在生产环境中，为了进一步提高消息的可靠性，可以配置镜像队列，将消息复制到多个节点上，防止单点故障导致消息丢失。
+3. 消费者端配置：
+   - 手动消息确认： 消费者在接收到消息后，不立即自动确认，而是通过手动发送basicAck或basicNack来确认消息是否处理成功。如果处理失败，可以将消息重新入队或放入死信队列。
+   - 设置QoS： 使用basicQos方法限制消费者同时处理的消息数量，避免消息积压和消费者过载，提高系统的稳定性和可靠性。
+
+**	本地事务表记录机制概述：**
+
+  该机制通过在本地数据库中维护一个事务表来记录消息的状态，事务表也就是说，业务和消息记录要在同一个事务中提交。表的结构 BIGINT的主键ID，业务ID，context、status、retry、创建时间、更新时间。
+  
+  生产者端处理流程：
+  
+  - 消息预提交： 在本地事务中，将消息记录插入到消息记录表中，状态标记为预提交。
+  - 发送消息： 将消息发送到RabbitMQ队列，同时将消息ID作为CorrelationData参数传递，以便在回调中关联消息记录。
+  
+  消费者端处理流程：
+  
+  - 消息处理与确认： 消费者接收到消息后，先将消息记录的状态更新为处理中，然后执行业务逻辑。如果处理成功，手动发送basicAck确认消息，并将消息记录的状态更新为已消费；如果处理失败，发送basicNack，并将消息重新入队或放入死信队列。
+  
+
+
+  异步确认机制：
+
+    生产者端处理流程：
+    
+    - 异步确认处理： 启用Confirm模式，并设置确认回调函数。在handleAck方法中，根据CorrelationData找到对应的消息记录，并将状态更新为已确认；在handleNack方法中，记录发送失败的消息，并根据业务需求决定是否重发。
+
+  消费者端处理流程
+  
+  - 定期检查与补偿： 定期扫描消息记录表，查找发送失败或未确认的消息，根据业务规则进行补偿发送或采取其他处理措施。
+
+
+
+②消费端异常分级是指什么？三级重试策略都是什么？是如何实现的？
+
+  重试级别	触发条件        	间隔时间    	实现方式           
+  一级重试	首次消费失败      	立即重试（1秒）	直接重新入队或本地循环重试  
+  二级重试	一级重试失败（N次后） 	延迟（10s） 	通过延迟队列 + TTL 实现
+  三级重试	二级重试失败（阈值触发）	长间隔（分钟级）	死信队列 + 告警人工介入  
+
+实现:
+
+  第一级：通过配置文件规定max-attempts、initial-interval让rabbitmq去自动重试
+  
+  第二级：在消息监听器的方法中，捕获异常并根据重试次数决定是否继续重试或放入死信队列中
+  
+  			在异常中通过获取消息头中的重试次数，具体：参数message.getproperties 然后再 getHeaders拿到重试次数。如果重试次数小于3，那么后投入到ttl为10s的延迟队列中
+  
+  ** 基础配置：延迟队列与死信路由**
+  
+  RabbitMQ 本身不直接提供延迟队列功能，利用 RabbitMQ 的 TTL（Time-To-Live） 和 DLX（Dead-Letter-Exchange） 组合实现延迟效果。
+  
+  1. 创建一个普通队列，设置消息的 TTL（存活时间）。
+  2. 当消息在队列中存活超过 TTL 后，会被自动转发到绑定的死信交换机。
+  3. 死信交换机将消息路由到实际消费队列，从而实现延迟投递。
+  
+  2. 具体实现步骤
+  
+  (1) 配置延迟队列和死信交换机
+  
+  通过命令行或管理界面配置（以下以 rabbitmqadmin 为例）：
+  
+      # 创建死信交换机（DLX）
+      rabbitmqadmin declare exchange name=dlx type=direct
+      
+      # 创建死信队列（用于最终消费）
+      rabbitmqadmin declare queue name=dead_letter_queue
+      rabbitmqadmin declare binding source=dlx destination=dead_letter_queue routing_key=dead_letter
+      
+      # 创建延迟队列（设置TTL和绑定DLX）
+      rabbitmqadmin declare queue name=retry_queue_5s arguments='{"x-message-ttl":5000,"x-dead-letter-exchange":"dlx","x-dead-letter-routing-key":"dead_letter"}'
+  
+  (2) 生产者发送延迟消息
+  
+  在代码中发送消息到延迟队列，并设置 TTL（或队列统一TTL）：
+  
+      AMQP.BasicProperties props = new AMQP.BasicProperties.Builder()
+          .expiration("5000") // 设置消息TTL为5秒（单位：毫秒）
+          .build();
+      channel.basicPublish("", "retry_queue_5s", props, message.getBytes());
+  
+  (3) 消费者监听死信队列
+  
+  消费者从死信队列消费消息，实现延迟后的处理：
+  
+      @RabbitListener(queues = "dead_letter_queue")
+      public void handleDelayedMessage(Message message) {
+          // 处理延迟后的消息（二级重试逻辑）
+      }
+  
+  第三级：
+  
+  1. 什么是死信队列？
+  
+  死信队列（DLQ）用于接收以下三类消息：
+  
+  1. 被拒绝的消息：消费者调用 basicNack 或 basicReject 且不重新入队。
+  2. 过期的消息：消息在队列中存活时间超过 TTL。
+  3. 队列满的消息：队列达到最大长度限制后被丢弃的消息。
+  
+  2. 死信队列的配置
+  
+  通过队列参数 x-dead-letter-exchange 和 x-dead-letter-routing-key 指定死信路由规则：
+  
+      # 普通队列绑定到死信交换机
+      rabbitmqadmin declare queue name=main_queue arguments='{"x-dead-letter-exchange":"dlx","x-dead-letter-routing-key":"dead_letter"}'
+      
+      # 死信交换机绑定到死信队列
+      rabbitmqadmin declare binding source=dlx destination=dead_letter_queue routing_key=dead_letter
+  
+  3. 代码中触发消息进入死信队列
+  
+  消费者主动拒绝消息并不重新入队：
+  
+      try {
+          process(message);
+          channel.basicAck(tag, false);
+      } catch (Exception e) {
+          // 拒绝消息并不重新入队（进入死信队列）
+          channel.basicNack(tag, false, false);
+      }
+  
+  4. 死信队列的监控与处理
+  
+  - 监控：通过 RabbitMQ 管理界面监控 dead_letter_queue 的堆积情况。
+  - 人工干预：修复问题后重新投递消息：
+        // 从死信队列取出消息，修复后重新发送到主队列
+        rabbitTemplate.convertAndSend("main_exchange", "routing_key", repairedMessage);
+  
+  完整二级重试与死信队列联动示例
+  
+  1. 架构流程
+  
+      生产者 → main_queue（主队列）
+             ↓ 消费失败
+             → retry_queue_5s（延迟队列，TTL=5秒）
+             ↓ TTL超时
+             → dlx（死信交换机） → dead_letter_queue（死信队列，人工处理）
+             ↓ 重试成功
+      消费者 ← 重新投递到 main_queue
+  
+  2. 代码实现
+  
+  (1) 消费者处理主队列消息
+  
+      @RabbitListener(queues = "main_queue")
+      public void handleMainMessage(Message message, Channel channel, @Header(AmqpHeaders.DELIVERY_TAG) long tag) {
+          try {
+              process(message);
+              channel.basicAck(tag, false);
+          } catch (TransientException e) {
+              // 一级重试：立即重试（本地循环）
+              for (int i = 0; i < 3; i++) {
+                  try {
+                      process(message);
+                      channel.basicAck(tag, false);
+                      return;
+                  } catch (Exception ex) {
+                      Thread.sleep(1000); // 简单等待
+                  }
+              }
+              // 一级重试失败，进入二级延迟队列
+              sendToRetryQueue(message, 1); // 初始重试次数为1
+              channel.basicAck(tag, false);
+          } catch (PersistentException e) {
+              // 直接进入死信队列
+              channel.basicNack(tag, false, false);
+          }
+      }
+  
+  (2) 发送到延迟队列（二级重试）
+  
+      private void sendToRetryQueue(Message message, int retryCount) {
+          long ttl = (long) (Math.pow(2, retryCount) * 1000); // 指数退避
+          AMQP.BasicProperties props = new AMQP.BasicProperties.Builder()
+                  .headers(Map.of("retry-count", retryCount))
+                  .expiration(String.valueOf(ttl))
+                  .build();
+          channel.basicPublish("", "retry_queue_5s", props, message.getBody());
+      }
+  
+  (3) 处理死信队列（三级重试）
+  
+      @RabbitListener(queues = "dead_letter_queue")
+      public void handleDeadLetterMessage(Message message) {
+          log.error("消息进入死信队列，需人工处理: {}", message);
+          // 人工修复后调用API重新投递
+          // repairAndRepublish(message);
+      }
+
+---
+
+四、注意事项
+
+1. TTL精度问题：
+   - RabbitMQ 的 TTL 是毫秒级，但实际延迟可能有几秒误差，不适用于高精度场景。
+   - 需要精确延迟时，可选用 RocketMQ 的定时消息或 Redis 的 ZSet 实现。
+2. 队列堆积风险：
+   - 若重试队列的消息积压，可能影响正常业务，需设置合理的队列长度限制（x-max-length）。
+3. 消息体序列化：
+   - 重试时需确保消息体可被多次序列化/反序列化，避免格式错误。
+4. 幂等性保障：
+   - 每条消息必须携带唯一ID，并在消费前校验是否已处理。
+
+
+
+
